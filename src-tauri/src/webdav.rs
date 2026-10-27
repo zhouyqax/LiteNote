@@ -27,6 +27,12 @@ use crate::{
 /// 远端文件名（存于用户配置的 remotePath 目录下，默认 /LiteNote/litenote.json）
 const DEFAULT_REMOTE_PATH: &str = "/LiteNote/litenote.json";
 
+/// 前端 `todoStore` 监听的待办变更事件（与 `src/stores/todoStore.ts` 的 TODOS_EVENT 保持一致）。
+///
+/// WebDAV 同步是 Rust 端直接写库的，前端不会自动感知；必须显式发这个事件，
+/// 否则数据虽已落库，界面仍停留在旧内容（表现为「明明同步了却看不到」）。
+const TODOS_UPDATED_EVENT: &str = "litenote-todos-updated";
+
 /// 后台定时同步间隔（秒）
 const SYNC_POLL_INTERVAL_SECS: u64 = 300;
 
@@ -299,6 +305,13 @@ fn overwrite_local_todos<R: Runtime>(app: &AppHandle<R>, sync: &SyncFile) -> Res
         )
         .map_err(|e| format!("写入待办失败: {e}"))?;
     }
+
+    // 通知前端重新加载待办。`source: "rust"` 不是任何窗口的 label，
+    // 前端 `initTodosSync` 的「跳过自身发出的消息」判断不会拦截它。
+    let _ = app.emit(
+        TODOS_UPDATED_EVENT,
+        serde_json::json!({ "ts": now_ms(), "source": "rust" }),
+    );
 
     Ok(())
 }
