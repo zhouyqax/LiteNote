@@ -6,15 +6,20 @@ use chrono::{Datelike, TimeDelta, Timelike, Months, NaiveDate, DateTime};
 use rusqlite::Connection;
 use tauri::{
     image::Image,
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, LogicalPosition, Manager, Runtime, WebviewUrl,
     WebviewWindowBuilder,
 };
+#[cfg(desktop)]
+use tauri::{
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 #[cfg(target_os = "macos")]
 use tauri::{ActivationPolicy, RunEvent, TitleBarStyle};
+#[cfg(desktop)]
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
+#[cfg(desktop)]
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 mod webdav;
@@ -23,6 +28,7 @@ mod webdav;
 const REMINDER_POLL_INTERVAL_SECS: u64 = 30;
 
 /// 持久化窗口位置/大小（不含可见性，避免上次隐藏后被恢复成隐藏态导致「启动打不开」）
+#[cfg(desktop)]
 fn window_persist_flags() -> StateFlags {
     StateFlags::SIZE | StateFlags::POSITION
 }
@@ -450,6 +456,7 @@ fn read_always_on_top<R: Runtime>(app: &AppHandle<R>) -> bool {
     read_setting_bool(&conn, "alwaysOnTop", false)
 }
 
+#[cfg(desktop)]
 fn build_tray_menu<R: Runtime>(
     app: &AppHandle<R>,
     focus_mode: bool,
@@ -489,6 +496,7 @@ fn build_tray_menu<R: Runtime>(
     )
 }
 
+#[cfg(desktop)]
 fn rebuild_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let focus_mode = read_focus_mode(app);
     let always_on_top = read_always_on_top(app);
@@ -501,7 +509,10 @@ fn rebuild_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 fn apply_focus_mode<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(), String> {
     write_setting_bool(app, "focusMode", enabled)?;
-    rebuild_tray_menu(app).map_err(|e| format!("更新托盘菜单失败: {e}"))?;
+    #[cfg(desktop)]
+    {
+        rebuild_tray_menu(app).map_err(|e| format!("更新托盘菜单失败: {e}"))?;
+    }
     app.emit(
         SETTINGS_UPDATED_EVENT,
         serde_json::json!({ "ts": now_ms(), "source": "rust" }),
@@ -510,16 +521,20 @@ fn apply_focus_mode<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(),
     Ok(())
 }
 
+#[cfg(desktop)]
 fn toggle_focus_mode<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     apply_focus_mode(app, !read_focus_mode(app))
 }
 
 fn apply_always_on_top<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<(), String> {
     write_setting_bool(app, "alwaysOnTop", enabled)?;
-    if let Some(w) = app.get_webview_window("main") {
-        w.set_always_on_top(enabled).map_err(|e| format!("设置置顶失败: {e}"))?;
+    #[cfg(desktop)]
+    {
+        if let Some(w) = app.get_webview_window("main") {
+            w.set_always_on_top(enabled).map_err(|e| format!("设置置顶失败: {e}"))?;
+        }
+        rebuild_tray_menu(app).map_err(|e| format!("更新托盘菜单失败: {e}"))?;
     }
-    rebuild_tray_menu(app).map_err(|e| format!("更新托盘菜单失败: {e}"))?;
     app.emit(
         SETTINGS_UPDATED_EVENT,
         serde_json::json!({ "ts": now_ms(), "source": "rust" }),
@@ -528,6 +543,7 @@ fn apply_always_on_top<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<
     Ok(())
 }
 
+#[cfg(desktop)]
 fn toggle_always_on_top<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     apply_always_on_top(app, !read_always_on_top(app))
 }
@@ -537,6 +553,7 @@ fn show_reminder_window<R: Runtime>(app: &AppHandle<R>, row: &ReminderRow) {
     let label = format!("reminder-{}", row.id);
 
     if let Some(existing) = app.get_webview_window(&label) {
+        #[cfg(desktop)]
         let _ = existing.unminimize();
         let _ = existing.show();
         return;
@@ -556,14 +573,18 @@ fn show_reminder_window<R: Runtime>(app: &AppHandle<R>, row: &ReminderRow) {
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
         .title("提醒")
         .inner_size(380.0, 160.0)
-        .resizable(false)
+        .resizable(false);
+    // 桌面端：无边框 / 透明 / 置顶 / 不占任务栏（移动端无这些概念）
+    #[cfg(desktop)]
+    let builder = builder
         .decorations(false)
         .transparent(true)            // 配合 WebView 透明背景，彻底去掉 1px 边
         .shadow(false)                // 卡片自带 box-shadow，不需要窗口级阴影
         .always_on_top(true)
         .skip_taskbar(true)
         .maximizable(false)
-        .focused(false)               // 关键：首次弹出也不抢焦点，让用户主动点
+        .focused(false);              // 关键：首次弹出也不抢焦点，让用户主动点
+    let builder = builder
         .visible(false);              // 先不可见，设好位置后再显示
 
     #[cfg(target_os = "macos")]
@@ -759,13 +780,16 @@ fn reminder_action(
 /// 前端隐藏窗口时调用：保存窗口状态再隐藏
 #[tauri::command]
 fn hide_main_window(app: AppHandle) -> Result<(), String> {
-    let flags = if read_focus_mode(&app) {
-        // 专注模式不写 SIZE，避免下次完整模式恢复到矮窗口
-        StateFlags::POSITION
-    } else {
-        window_persist_flags()
-    };
-    app.save_window_state(flags).map_err(|e| format!("保存窗口状态失败: {e}"))?;
+    #[cfg(desktop)]
+    {
+        let flags = if read_focus_mode(&app) {
+            // 专注模式不写 SIZE，避免下次完整模式恢复到矮窗口
+            StateFlags::POSITION
+        } else {
+            window_persist_flags()
+        };
+        app.save_window_state(flags).map_err(|e| format!("保存窗口状态失败: {e}"))?;
+    }
     if let Some(w) = app.get_webview_window("main") {
         w.hide().map_err(|e| format!("隐藏窗口失败: {e}"))?;
     }
@@ -785,12 +809,20 @@ fn set_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 /// 重新注册全局快捷键（前端修改快捷键设置后调用）
+#[cfg(desktop)]
 #[tauri::command]
 fn update_shortcuts(app: AppHandle) -> Result<(), String> {
     app.global_shortcut()
         .unregister_all()
         .map_err(|e| format!("取消注册快捷键失败: {e}"))?;
     register_all_shortcuts(&app)
+}
+
+/// 移动端无全局快捷键概念，保留同名命令供前端调用
+#[cfg(not(desktop))]
+#[tauri::command]
+fn update_shortcuts(_app: AppHandle) -> Result<(), String> {
+    Ok(())
 }
 
 /// 将用户选择的背景图片复制到应用数据目录（background/wallpaper.<ext>），
@@ -909,6 +941,7 @@ pub(crate) fn read_setting_string_app<R: Runtime>(
 }
 
 /// 从 settings 表读取快捷键配置并注册全局快捷键（空字符串 = 不注册）
+#[cfg(desktop)]
 fn register_all_shortcuts<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let (toggle_window, toggle_focus, toggle_pin) = match litenote_db_path(app) {
         Some(db_path) if db_path.exists() => match Connection::open(&db_path) {
@@ -1020,6 +1053,7 @@ fn start_rust_reminder_poll(app: &AppHandle) {
     });
 }
 
+#[cfg(desktop)]
 fn tray_image<R: Runtime>(app: &AppHandle<R>) -> Image<'static> {
     if let Some(icon) = app.default_window_icon() {
         return Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height());
@@ -1079,6 +1113,7 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         // 先修正可能的离屏坐标，再显示/聚焦，确保窗口一定出现在可见区域
         ensure_window_on_screen(&w);
         let _ = w.show();
+        #[cfg(desktop)]
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
@@ -1089,15 +1124,19 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
         if let Ok(visible) = w.is_visible() {
             if visible {
                 // 隐藏前保存窗口状态（位置 + 大小；专注模式不写 SIZE）
-                let flags = if read_focus_mode(app) {
-                    StateFlags::POSITION
-                } else {
-                    window_persist_flags()
-                };
-                let _ = app.save_window_state(flags);
+                #[cfg(desktop)]
+                {
+                    let flags = if read_focus_mode(app) {
+                        StateFlags::POSITION
+                    } else {
+                        window_persist_flags()
+                    };
+                    let _ = app.save_window_state(flags);
+                }
                 let _ = w.hide();
             } else {
                 let _ = w.show();
+                #[cfg(desktop)]
                 let _ = w.unminimize();
                 let _ = w.set_focus();
             }
@@ -1107,7 +1146,7 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             reminder_action,
             hide_main_window,
@@ -1126,10 +1165,14 @@ pub fn run() {
         ])
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_sql::Builder::new().build())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+
+    // 桌面端专属插件：全局快捷键 / 窗口状态 / 开机自启在 Android 上无对应实现
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_persist_flags())
@@ -1138,8 +1181,13 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
-        ))
+        ));
+
+    builder
         .setup(|app| {
+            // ── 桌面端专属初始化（托盘 / 置顶 / 窗口形态）──
+            #[cfg(desktop)]
+            {
             // 小部件模式：Windows 不在任务栏显示；macOS 不在 Dock 显示（仅托盘）
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
@@ -1218,6 +1266,7 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            } // end desktop-only init
 
             // 启动 Rust 端后台提醒轮询（独立于前端，macOS 窗口隐藏时也能可靠运行）
             start_rust_reminder_poll(app.handle());
@@ -1225,7 +1274,8 @@ pub fn run() {
             // 启动 Rust 端后台 WebDAV 同步轮询（仅启用时执行单向上传）
             webdav::start_webdav_sync_poll(app.handle());
 
-            // 全局快捷键：从设置中读取配置并注册
+            // 全局快捷键：从设置中读取配置并注册（桌面端专属）
+            #[cfg(desktop)]
             if let Err(e) = register_all_shortcuts(app.handle()) {
                 eprintln!("[LiteNote] 全局快捷键注册失败: {e}");
             }
