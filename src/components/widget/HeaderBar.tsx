@@ -95,6 +95,7 @@ export function HeaderBar({
           </svg>
         </button>
         <button
+          data-desktop-only
           type="button"
           className={iconBtn}
           style={iconStyle}
@@ -106,6 +107,7 @@ export function HeaderBar({
           <Icon name={alwaysOnTop ? "pushpin-fill" : "pushpin-line"} />
         </button>
         <button
+          data-desktop-only
           type="button"
           className={iconBtn}
           style={iconStyle}
@@ -128,7 +130,8 @@ export function HeaderBar({
             </svg>
           )}
         </button>
-        <button type="button" className={iconBtn} style={iconStyle} title={mk("hideWindow")} onClick={onHide}>
+        <button
+          data-desktop-only type="button" className={iconBtn} style={iconStyle} title={mk("hideWindow")} onClick={onHide}>
           <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden>
             <path d="M6 12h12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
           </svg>

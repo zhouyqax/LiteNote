@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -255,6 +255,31 @@ export function WidgetShell() {
   }, [todos, locale, setTodoSuccess]);
 
   // 拖拽传感器
+  // ── 列表左右滑动切换「进行中 / 已完成」──
+  // 只在水平位移 ≥70px 且明显大于垂直位移时触发，避免和纵向滚动/拖拽排序打架。
+  const swipeRef = useRef<{ x: number; y: number } | null>(null);
+
+  const onListTouchStart = useCallback((e: React.TouchEvent) => {
+    const t = e.touches[0];
+    swipeRef.current = { x: t.clientX, y: t.clientY };
+  }, []);
+
+  const onListTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      const s = swipeRef.current;
+      swipeRef.current = null;
+      // 拖拽排序进行中时忽略滑动
+      if (!s || activeDragTodo) return;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - s.x;
+      const dy = t.clientY - s.y;
+      if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+      if (dx < 0) setTodoView("completed"); // 左滑 → 已完成
+      else setTodoView("active"); // 右滑 → 进行中
+    },
+    [activeDragTodo],
+  );
+
   const sensors = useSensors(
     useSensor(PointerSensor, {
       activationConstraint: { distance: 5 },
@@ -408,6 +433,11 @@ export function WidgetShell() {
             </div>
           </div>
 
+          <div
+            className="flex min-h-0 min-w-0 flex-1 flex-col"
+            onTouchStart={onListTouchStart}
+            onTouchEnd={onListTouchEnd}
+          >
           <TodoList
             locale={locale}
             todos={filteredTodos}
@@ -430,6 +460,7 @@ export function WidgetShell() {
             openNoteForId={openNoteForId}
             onOpenNote={setOpenNoteForId}
           />
+          </div>
 
           {/* 拖拽预览：显示待办内容 */}
           <DragOverlay dropAnimation={null}>

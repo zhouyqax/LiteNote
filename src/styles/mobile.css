@@ -1,0 +1,93 @@
+/* ══════════════════════════════════════════════════════════════
+   移动端（Android / iOS）适配层  v5
+   ──────────────────────────────────────────────────────────────
+   生效条件：<html class="ln-mobile">（由 main.tsx 按 User-Agent 添加）
+   桌面端（Windows / macOS / Linux）不受任何影响。
+
+   v5 修正（2026-10-26 真机实测）：
+   · 安全区 padding 只加在 #root 一处。v4 同时加在 html/body/#root，
+     CSS padding 逐层累加（34×3≈102dp），导致顶栏被推到 114dp。
+   · 顶部固定 34px（= 状态栏高度），不用 env(safe-area-inset-top)：
+     该值在华为刘海屏返回 60dp。
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── 1. 外层背景（不含 padding） ── */
+html.ln-mobile,
+html.ln-mobile body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: #2d6991;
+  background-image: var(--ln-theme-bg);
+  background-size: cover;
+  border-radius: 0 !important;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* ── 2. 根节点：唯一施加安全区的地方 ── */
+html.ln-mobile #root {
+  height: 100%;
+  margin: 0;
+  background-color: transparent;
+  border-radius: 0 !important;
+  overflow: hidden;
+
+  /* 顶部 34px：状态栏高度，顶栏紧接其下 */
+  padding-top: 34px;
+  /* 底部：手势条安全区 */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+
+  box-sizing: border-box;
+}
+
+/* 移动端取消窗口拖拽语义 */
+html.ln-mobile [data-tauri-drag-region] {
+  -webkit-app-region: no-drag;
+  cursor: default !important;
+}
+
+/* ── 3. 字号 ── */
+html.ln-mobile body {
+  font-size: 17px;
+  -webkit-text-size-adjust: 100%;
+}
+
+html.ln-mobile .text-sm        { font-size: 17px !important; line-height: 1.4  !important; }
+html.ln-mobile .text-\[9px\]   { font-size: 16px !important; line-height: 1.35 !important; }
+html.ln-mobile .text-\[10px\]  { font-size: 15px !important; line-height: 1.35 !important; }
+html.ln-mobile .text-\[11px\]  { font-size: 16px !important; line-height: 1.4  !important; }
+html.ln-mobile .text-\[12px\],
+html.ln-mobile .text-xs        { font-size: 15px !important; line-height: 1.4  !important; }
+html.ln-mobile .text-base      { font-size: 18px !important; }
+html.ln-mobile .text-lg        { font-size: 20px !important; }
+
+/* ── 4. 图标 ── */
+html.ln-mobile .h-4.w-4       { width: 24px !important; height: 24px !important; }
+html.ln-mobile .h-3\.5.w-3\.5 { width: 20px !important; height: 20px !important; }
+html.ln-mobile .h-5.w-5       { width: 26px !important; height: 26px !important; }
+
+/* ── 5. 触摸 ── */
+html.ln-mobile button {
+  touch-action: manipulation;
+}
+
+/* ── 6. 滚动条 ── */
+html.ln-mobile *::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+}
+
+/* ── 7. 输入框防自动放大 ── */
+html.ln-mobile input,
+html.ln-mobile textarea,
+html.ln-mobile select {
+  font-size: 17px !important;
+}
+
+/* ── 8. 桌面专属控件在移动端隐藏 ──
+   HeaderBar 里的「置顶 / 锁定 / 最小化」在 Android/iOS 上没有对应概念，
+   用属性标记而非删代码，桌面端功能不受影响。 */
+html.ln-mobile [data-desktop-only] {
+  display: none !important;
+}
