@@ -347,32 +347,87 @@ fn get_config<R: Runtime>(
 
 /// 本地与远端逐条合并（last-write-wins：以 update_time 较大者为准）。
 ///
-/// 重要语义：本项目删除为硬删除，且「本机删除 = 本地权威」。`merge_todos` 仅用于后台 5 分钟
-/// 双向同步，因此当某 id 在本地已不存在（即用户已删除）时，**不从远端接纳该待办**，避免
-/// 云端残留的历史数据被反复复活（复活后又会触发过期提醒弹窗）。
+/// `known` = **上次同步成功后云端存在的 id 集合**，用来区分两种「本地没有」：
 ///
-/// - 本地存在的条目：按 update_time 较大者为准（多设备互相覆盖丢数据的防护）。
-/// - 本地不存在的远端条目（已删除）：丢弃。若用户确实需要「从云端恢复整份数据」，请使用
-///   手动的 `download_from_webdav`（走 overwrite_local_todos，不经过本合并逻辑）。
-fn merge_todos(local: Vec<TodoItemSync>, remote: Vec<TodoItemSync>) -> Vec<TodoItemSync> {
-    let mut map: std::collections::HashMap<String, TodoItemSync> = std::collections::HashMap::new();
-    for t in local {
-        map.insert(t.id.clone(), t);
-    }
-    for r in remote {
+/// - **在 `known` 里** → 曾经同步过、现在本地没了 = 本机删除的 ⇒ 丢弃（不会被云端复活）。
+/// - **不在 `known` 里** → 从没见过 = 其他设备新增的 ⇒ **接收**。
+///
+/// 反向同理：本地有、远端没有，且 id 在 `known` 里 ⇒ 云端已删 ⇒ 从本地删掉；
+/// 不在 `known` 里 ⇒ 本地新增、还没上传 ⇒ 保留。
+///
+/// 平手（`update_time` 相等）时按 `(text, completed)` 字典序裁决 —— 关键是让比较
+/// **可交换**（`merge(A,B)` 与 `merge(B,A)` 结果相同），多设备才会收敛到同一份数据，
+/// 而不是各自保留自己的版本。
+///
+/// 若用户确实需要「用云端整份覆盖本地」，请用 `download_from_webdav`（不经过本逻辑）。
+fn merge_todos(
+    local: Vec<TodoItemSync>,
+    remote: Vec<TodoItemSync>,
+    known: &std::collections::HashSet<String>,
+) -> Vec<TodoItemSync> {
+    use std::collections::{HashMap, HashSet};
+
+    let local_ids: HashSet<String> = local.iter().map(|t| t.id.clone()).collect();
+    let remote_ids: HashSet<String> = remote.iter().map(|t| t.id.clone()).collect();
+    let mut map: HashMap<String, TodoItemSync> =
+        local.into_iter().map(|t| (t.id.clone(), t)).collect();
+
+    // ① 远端 → 本地
+    for r in &remote {
         match map.get(&r.id) {
-            // 本地仍存在的条目：last-write-wins
-            Some(l) if l.update_time >= r.update_time => { /* 本地更新更新，保留本地 */ }
-            Some(_) => {
-                map.insert(r.id.clone(), r);
+            Some(l) => {
+                // 两边都有：update_time 大者胜；平手时按 (text, completed) 确定性裁决
+                let take_remote = if l.update_time != r.update_time {
+                    r.update_time > l.update_time
+                } else {
+                    (r.text.as_str(), r.completed) > (l.text.as_str(), l.completed)
+                };
+                if take_remote {
+                    map.insert(r.id.clone(), r.clone());
+                }
             }
-            // 本地已删除（id 不存在）：丢弃远端残留，不同步回来
-            None => { /* 本地已删除，保持权威，不接纳远端 */ }
+            // 曾经同步过、现在本地没了 = 本机删除的 → 丢弃，不复活
+            None if known.contains(&r.id) => {}
+            // 从没见过 = 其他设备新增 → 接收
+            None => {
+                map.insert(r.id.clone(), r.clone());
+            }
         }
     }
+
+    // ② 本地 → 远端：云端已删除的，也要从本地删掉
+    for id in &local_ids {
+        if !remote_ids.contains(id) && known.contains(id) {
+            map.remove(id);
+        }
+    }
+
     let mut merged: Vec<TodoItemSync> = map.into_values().collect();
     merged.sort_by(|a, b| a.update_time.cmp(&b.update_time));
     merged
+}
+
+/// 读取「上次同步成功后云端存在的 id 集合」。
+fn read_known_ids<R: Runtime>(app: &AppHandle<R>) -> std::collections::HashSet<String> {
+    let raw = read_setting_string_app(app, "webdavKnownIds", "");
+    serde_json::from_str::<Vec<String>>(&raw)
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// 保存「本次同步成功后云端存在的 id 集合」。
+/// **只在 PUT 成功后调用** —— 失败时保持旧值，下次同步自动重来，不会有副作用。
+fn write_known_ids<R: Runtime>(
+    app: &AppHandle<R>,
+    ids: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let mut v: Vec<String> = ids.iter().cloned().collect();
+    v.sort();
+    write_setting_string(
+        app,
+        "webdavKnownIds",
+        &serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
 /// 立即同步：本地强制覆盖云端（单向上传，本地 → 云端）。
@@ -461,7 +516,10 @@ fn sync_to_webdav<R: Runtime>(app: &AppHandle<R>, ov: Option<&ConfigOverride>) -
         Err(e) => return Err(format!("下载请求失败: {e}")),
     };
 
-    let merged = merge_todos(local, remote_todos);
+    let known = read_known_ids(app);
+    let merged = merge_todos(local, remote_todos, &known);
+    let merged_ids: std::collections::HashSet<String> =
+        merged.iter().map(|t| t.id.clone()).collect();
 
     // 写回本地（合并结果）
     overwrite_local_todos(app, &SyncFile {
@@ -494,6 +552,8 @@ fn sync_to_webdav<R: Runtime>(app: &AppHandle<R>, ov: Option<&ConfigOverride>) -
     }
     eprintln!("[webdav] sync: 成功");
 
+    // 记录本次成功上传到云端的 id 集合，供下次合并区分「其他设备新增」与「本机已删除」
+    write_known_ids(app, &merged_ids)?;
     set_last_sync(app, now_ms())?;
     Ok(())
 }
@@ -754,4 +814,111 @@ pub async fn webdav_status(app: AppHandle) -> Result<WebdavStatus, String> {
     })
     .await
     .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn t(id: &str, text: &str, update_time: i64) -> TodoItemSync {
+        TodoItemSync {
+            id: id.into(),
+            text: text.into(),
+            completed: false,
+            pinned: false,
+            color_id: Some("none".into()),
+            due_date: 0,
+            reminded: false,
+            is_recurring: false,
+            recurrence_type: "none".into(),
+            recurrence_config: String::new(),
+            update_time,
+            create_time: 0,
+            completed_time: 0,
+        }
+    }
+
+    fn ids(v: &[TodoItemSync]) -> Vec<String> {
+        let mut x: Vec<String> = v.iter().map(|i| i.id.clone()).collect();
+        x.sort();
+        x
+    }
+
+    fn known(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 场景 1：其他设备新增的条目（不在 known 里）→ 必须被接收。
+    /// 这是本次修复要解决的核心问题（旧实现在这里会丢弃）。
+    #[test]
+    fn accepts_new_remote_item_not_in_known() {
+        let local = vec![t("a", "本机已有", 100)];
+        let remote = vec![t("a", "本机已有", 100), t("new", "另一台新增", 200)];
+        let merged = merge_todos(local, remote, &known(&["a"]));
+        assert_eq!(ids(&merged), vec!["a", "new"]);
+    }
+
+    /// 场景 2：本机删除的条目（在 known 里但本地没有）→ 不能被云端复活。
+    #[test]
+    fn does_not_resurrect_locally_deleted() {
+        let local = vec![t("a", "留下的", 100)];
+        let remote = vec![t("a", "留下的", 100), t("deleted", "我删掉的", 50)];
+        let merged = merge_todos(local, remote, &known(&["a", "deleted"]));
+        assert_eq!(ids(&merged), vec!["a"]);
+    }
+
+    /// 场景 3：云端删除的条目（本地有、远端无、且在 known 里）→ 本地也要删。
+    #[test]
+    fn removes_item_deleted_on_remote() {
+        let local = vec![t("a", "留下的", 100), t("gone", "别人删的", 50)];
+        let remote = vec![t("a", "留下的", 100)];
+        let merged = merge_todos(local, remote, &known(&["a", "gone"]));
+        assert_eq!(ids(&merged), vec!["a"]);
+    }
+
+    /// 场景 4：本地新增、还没上传（不在 known 里）→ 必须保留。
+    #[test]
+    fn keeps_local_item_never_synced() {
+        let local = vec![t("a", "留下的", 100), t("mine", "本机新加", 300)];
+        let remote = vec![t("a", "留下的", 100)];
+        let merged = merge_todos(local, remote, &known(&["a"]));
+        assert_eq!(ids(&merged), vec!["a", "mine"]);
+    }
+
+    /// 场景 5：update_time 大者胜（两个方向都要对）。
+    #[test]
+    fn last_write_wins() {
+        let merged = merge_todos(
+            vec![t("a", "旧", 100)],
+            vec![t("a", "新", 200)],
+            &known(&["a"]),
+        );
+        assert_eq!(merged[0].text, "新");
+
+        let merged = merge_todos(
+            vec![t("a", "新", 200)],
+            vec![t("a", "旧", 100)],
+            &known(&["a"]),
+        );
+        assert_eq!(merged[0].text, "新");
+    }
+
+    /// 场景 6：平手时必须**可交换** —— merge(A,B) 与 merge(B,A) 结果一致。
+    /// 这是多设备收敛的前提（旧实现用 `>=` 保留本地，导致两端永久漂移）。
+    #[test]
+    fn tie_break_is_commutative() {
+        let a = vec![t("x", "AAA", 100)];
+        let b = vec![t("x", "BBB", 100)];
+        let ab = merge_todos(a.clone(), b.clone(), &known(&["x"]));
+        let ba = merge_todos(b, a, &known(&["x"]));
+        assert_eq!(ab[0].text, ba[0].text, "平手裁决必须可交换，否则两端永久漂移");
+    }
+
+    /// 场景 7：空 known（新设备首次同步）→ 远端条目全部接收。
+    #[test]
+    fn first_sync_accepts_everything() {
+        let merged = merge_todos(vec![], vec![t("a", "云端A", 100), t("b", "云端B", 200)], &known(&[]));
+        assert_eq!(ids(&merged), vec!["a", "b"]);
+    }
 }
